@@ -1,0 +1,163 @@
+#!/usr/bin/perl
+
+#
+# Compares the structures of two databases and makes
+# the second one with the same structure as the first one.
+#
+
+# @author Javor Dimitrov
+# @date 29.03.2016
+# @version 1.0
+
+# @todo Add command line arguments instead of in-file settings.
+
+use strict;
+use DBI;
+
+### Settings
+
+# Development environment
+# Source database structure
+my $DEV_DBHOST = 'localhost';
+my $DEV_DBUSER = 'dbuser';
+my $DEV_DBPASS = 'password';
+my $DEV_DB     = 'db1';
+
+# Production environment
+# Destination database
+my $PRO_DBHOST = 'localhost';
+my $PRO_DBUSER = 'dbuser';
+my $PRO_DBPASS = 'password';
+my $PRO_DB     = 'db2';
+
+### End of Settings
+
+my $dev_dbh = DBI->connect("DBI:mysql:database=$DEV_DB;host=$DEV_DBHOST", $DEV_DBUSER, $DEV_DBPASS) ||
+  die "Can't connect to development database\n";
+my $pro_dbh = DBI->connect("DBI:mysql:database=$PRO_DB;host=$PRO_DBHOST", $PRO_DBUSER, $PRO_DBPASS) ||
+  die "Can't connect to production database\n";
+
+my ($sth, $r);
+my (@dev_t, @pro_t, @queries);
+
+# Load tables in development and production databases
+$sth = $dev_dbh->prepare("SHOW TABLES");
+$sth->execute();
+push @dev_t, $r->{(keys $r)[0]} while($r = $sth->fetchrow_hashref());
+
+$sth = $pro_dbh->prepare("SHOW TABLES");
+$sth->execute();
+push @pro_t, $r->{(keys $r)[0]} while($r = $sth->fetchrow_hashref());
+
+
+foreach my $dev_table(@dev_t) {
+
+  # If development table doesn't exist in production database, then create it
+  if(!grep(/^$dev_table$/, @pro_t)) {
+    print "Development table $dev_table is missing in production database. Creating table.\n";
+    $sth = $dev_dbh->prepare("DESCRIBE $dev_table");
+    $sth->execute();
+    my ($pri_key, @fields);
+    while($r = $sth->fetchrow_hashref()) {
+      push @fields, rec2sql($r);
+      $pri_key = $r->{Field} if($r->{Key} eq 'PRI');
+    }
+
+    push @fields, "PRIMARY KEY (" . $pri_key . ")" if($pri_key);
+    my $query = "CREATE TABLE IF NOT EXISTS `$dev_table` (" . join(', ', @fields) . ") " .
+      "ENGINE=InnoDB DEFAULT CHARSET=utf8 COLLATE=utf8_unicode_ci AUTO_INCREMENT=1";
+    push @queries, $query;
+  }
+  
+  # If development table exists in production database, then compare both tables' fields
+  else {
+    $sth = $dev_dbh->prepare("DESCRIBE $dev_table");
+    $sth->execute();
+    my @dev_fields;
+    push @dev_fields, $r while($r = $sth->fetchrow_hashref());
+    
+    $sth = $pro_dbh->prepare("DESCRIBE $dev_table");
+    $sth->execute();
+    my @pro_fields;
+    push @pro_fields, $r while($r = $sth->fetchrow_hashref());
+    
+    foreach my $dev_rec (@dev_fields) {
+      my $exists = 0;
+      my ($pro_rec, $alter_pro_rec);
+      foreach $pro_rec (@pro_fields) {
+        if($dev_rec->{Field} eq $pro_rec->{Field}) {
+          $exists = 1;
+          $alter_pro_rec = $pro_rec;
+          last;
+        }
+      }
+
+      # Field exists in production database table
+      # Check if it needs to be altered
+      if($exists) {
+        my $diff = 0;
+        foreach my $k(keys $dev_rec) {
+          #print "$k => " . $dev_rec->{$k} . "\n";
+          if($dev_rec->{$k} ne $alter_pro_rec->{$k}) {
+            $diff = 1;
+            last;
+          }
+        }
+        if($diff) {
+          push @queries, "ALTER TABLE `$dev_table` CHANGE COLUMN `$dev_rec->{Field}` " . rec2sql($dev_rec);
+        }
+      }
+      
+      # Field doesn't exist in production database table
+      # Create it
+      else {
+        push @queries, "ALTER TABLE `$dev_table` ADD COLUMN " . rec2sql($dev_rec);
+      }
+    }
+    
+    # Check if some fields exist in production database, but don't exist in development database
+    # Must be dropped
+    foreach my $pro_rec (@pro_fields) {
+      my $exists = 0;
+      foreach my $dev_rec (@dev_fields) {
+        if($pro_rec->{Field} eq $dev_rec->{Field}) {
+          $exists = 1;
+          last;
+        }
+      }
+      push @queries, "ALTER TABLE `$dev_table` DROP COLUMN `$pro_rec->{Field}`" if(!$exists);
+    }
+  }
+}
+
+# Check for tables in production database that don't exist in development database
+# Drop them
+foreach my $pro_table(@pro_t) {
+  if(!grep(/^$pro_table$/, @dev_t)) {
+    print "Production table $pro_table is missing in development database. Dropping table\n";
+    push @queries,
+      "DROP TABLE $pro_table";
+  }
+}
+
+# Execute all the queries
+foreach my $q(@queries) {
+  $pro_dbh->do($q);
+  print "$q\n";
+}
+
+
+
+# Turn DESCRIBE record to MySQL syntax
+sub rec2sql {
+  my $r = shift;
+  my @result = ();
+
+  push @result, '`' . $r->{Field} . '`';
+  push @result, $r->{Type};
+  push @result, ($r->{Null} eq 'NO' ? 'NOT NULL' : '');
+  push @result, ($r->{Default} ? 'DEFAULT ' . $r->{Default} : '');
+  push @result, $r->{Extra};
+  
+  join(' ', @result);
+}
